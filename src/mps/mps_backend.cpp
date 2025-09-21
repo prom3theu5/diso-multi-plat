@@ -1,6 +1,9 @@
 #include "mps_backend.h"
 #include "mps_tables.h"
+#include <algorithm>
 #include <array>
+#include <cerrno>
+#include <cstdlib>
 #include <iostream>
 #include <vector>
 
@@ -136,37 +139,106 @@ std::tuple<torch::Tensor, torch::Tensor> MPSMarchingCubesBackend<Scalar, IndexTy
 
     const int64_t num_cubes = nx * ny * nz;
     auto grid_dtype = grid.dtype();
+    auto options = grid.options();
 
-    // Gather per-vertex scalar values for each cube
+    TORCH_CHECK(cube_codes.dim() == 1, "Cube code tensor must be 1D");
+
+    auto active_mask = (cube_codes != 0) & (cube_codes != 255);
+    auto active_indices = torch::nonzero(active_mask).squeeze(1);
+    int64_t num_active = active_indices.size(0);
+
+    if (num_active == 0) {
+        auto empty_verts = torch::empty({0, 3}, options.dtype(grid_dtype).device(device_));
+        auto empty_tris = torch::empty({0, 3}, torch::TensorOptions().dtype(torch::kInt32).device(device_));
+        return {empty_verts, empty_tris};
+    }
+
+    auto active_cube_codes = cube_codes.index_select(0, active_indices);
+    auto active_cube_codes_long = active_cube_codes.to(torch::kLong);
+
+    const int64_t default_chunk = 250000;
+    int64_t chunk_limit = default_chunk;
+    if (const char* env_chunk = std::getenv("DISO_MPS_CHUNK_SIZE")) {
+        char* end_ptr = nullptr;
+        errno = 0;
+        auto parsed = std::strtoll(env_chunk, &end_ptr, 10);
+        if (end_ptr != env_chunk && errno == 0 && parsed > 0) {
+            chunk_limit = static_cast<int64_t>(parsed);
+        } else {
+            std::cout << "DISO_MPS_CHUNK_SIZE invalid, using default " << default_chunk << std::endl;
+        }
+    }
+
+    if (chunk_limit <= 0) {
+        chunk_limit = 1;
+    }
+
+    const int64_t stride_x = ny * nz;
+    const int64_t stride_y = nz;
+
+    std::vector<int64_t> chunk_vertex_totals;
+    chunk_vertex_totals.reserve((num_active + chunk_limit - 1) / chunk_limit);
+    int64_t total_vertices = 0;
+
+    for (int64_t start = 0; start < num_active; start += chunk_limit) {
+        int64_t end = std::min(start + chunk_limit, num_active);
+        auto chunk_codes = active_cube_codes_long.slice(0, start, end);
+        auto tri_edges = tri_table_.index_select(0, chunk_codes);
+        auto valid_mask = tri_edges >= 0;
+        auto chunk_vertices = valid_mask.sum().template item<int64_t>();
+        chunk_vertex_totals.push_back(chunk_vertices);
+        total_vertices += chunk_vertices;
+    }
+
+    if (total_vertices == 0) {
+        auto empty_verts = torch::empty({0, 3}, options.dtype(grid_dtype).device(device_));
+        auto empty_tris = torch::empty({0, 3}, torch::TensorOptions().dtype(torch::kInt32).device(device_));
+        return {empty_verts, empty_tris};
+    }
+
+    TORCH_CHECK(total_vertices % 3 == 0,
+                "Marching Cubes produced non-triangle vertex count: ", total_vertices);
+
+    auto verts = torch::empty({total_vertices, 3}, options.dtype(grid_dtype).device(device_));
+    auto tris = torch::empty({total_vertices / 3, 3}, torch::TensorOptions().dtype(torch::kInt32).device(device_));
+
+    auto edge_connections = edge_connection_table_.to(torch::TensorOptions().dtype(torch::kLong).device(device_));
+    auto v0_idx = edge_connections.select(1, 0);
+    auto v1_idx = edge_connections.select(1, 1);
+
+    auto vertex_offsets_tensor = vertex_offset_table_.to(options.dtype(grid_dtype));
+    auto vertex_offsets_v0 = vertex_offsets_tensor.index_select(0, v0_idx);
+    auto vertex_offsets_v1 = vertex_offsets_tensor.index_select(0, v1_idx);
+    auto edge_diff_tensor = (vertex_offsets_v1 - vertex_offsets_v0).to(options.dtype(grid_dtype));
+
     auto vertex_values = gather_vertex_values(grid, nx, ny, nz);
     std::array<torch::Tensor, 8> vertex_values_flat;
     for (int i = 0; i < 8; ++i) {
         vertex_values_flat[i] = vertex_values[i].reshape({num_cubes});
     }
 
-    // Precompute cube origins
-    auto base_options = grid.options();
-    auto xs = torch::arange(0, nx, base_options).view({nx, 1, 1}).expand({nx, ny, nz}).reshape({num_cubes});
-    auto ys = torch::arange(0, ny, base_options).view({1, ny, 1}).expand({nx, ny, nz}).reshape({num_cubes});
-    auto zs = torch::arange(0, nz, base_options).view({1, 1, nz}).expand({nx, ny, nz}).reshape({num_cubes});
-    auto base_coords = torch::stack({xs, ys, zs}, 1);
+    int64_t vertex_offset = 0;
+    int64_t triangle_offset = 0;
+    size_t chunk_index = 0;
 
-    // Prepare lookup tables needed for interpolation
-    auto vertex_offsets = vertex_offset_table_.to(grid.options().dtype(grid_dtype));
+    for (int64_t start = 0; start < num_active; start += chunk_limit, ++chunk_index) {
+        int64_t end = std::min(start + chunk_limit, num_active);
+        auto chunk_indices = active_indices.slice(0, start, end);
+        auto chunk_codes_long = active_cube_codes_long.slice(0, start, end);
 
-    std::vector<torch::Tensor> edge_positions;
-    edge_positions.reserve(12);
+        if (chunk_indices.numel() == 0) {
+            continue;
+        }
 
-    auto iso_full = torch::full({num_cubes}, iso, grid.options());
-    auto edge_connections_cpu = edge_connection_table_.to(torch::kCPU);
+        std::vector<torch::Tensor> vertex_values_chunk_vec;
+        vertex_values_chunk_vec.reserve(8);
+        for (int i = 0; i < 8; ++i) {
+            vertex_values_chunk_vec.push_back(vertex_values_flat[i].index_select(0, chunk_indices));
+        }
+        auto vertex_values_chunk = torch::stack(vertex_values_chunk_vec, 0); // [8, chunk_size]
 
-    for (int edge = 0; edge < 12; ++edge) {
-        auto edge_row = edge_connections_cpu.select(0, edge);
-        int v0 = edge_row.select(0, 0).template item<int>();
-        int v1 = edge_row.select(0, 1).template item<int>();
-
-        auto val0 = vertex_values_flat[v0];
-        auto val1 = vertex_values_flat[v1];
+        auto val0 = vertex_values_chunk.index_select(0, v0_idx).transpose(0, 1);
+        auto val1 = vertex_values_chunk.index_select(0, v1_idx).transpose(0, 1);
 
         auto denom = val1 - val0;
         auto abs_denom = torch::abs(denom);
@@ -175,41 +247,55 @@ std::tuple<torch::Tensor, torch::Tensor> MPSMarchingCubesBackend<Scalar, IndexTy
         auto safe_sign = torch::where(sign == 0, torch::ones_like(sign), sign);
         auto safe_denom = torch::where(abs_denom < eps_tensor, safe_sign * eps_tensor, denom);
 
-        auto t = (iso_full - val0) / safe_denom;
-        t = torch::clamp(t, static_cast<Scalar>(0), static_cast<Scalar>(1));
+        auto iso_tensor = torch::full_like(val0, static_cast<Scalar>(iso));
+        auto raw_t = (iso_tensor - val0) / safe_denom;
+        auto t = torch::clamp(raw_t, static_cast<Scalar>(0), static_cast<Scalar>(1));
 
-        auto offset0 = vertex_offsets.select(0, v0);
-        auto offset1 = vertex_offsets.select(0, v1);
-        auto diff = offset1 - offset0;
+        auto xs = torch::div(chunk_indices, stride_x, "floor");
+        auto rem = torch::remainder(chunk_indices, stride_x);
+        auto ys = torch::div(rem, stride_y, "floor");
+        auto zs = torch::remainder(rem, stride_y);
+        auto base_coords = torch::stack({xs, ys, zs}, 1).to(options.dtype(grid_dtype));
 
-        auto pos = base_coords + offset0.unsqueeze(0) + t.unsqueeze(1) * diff.unsqueeze(0);
-        edge_positions.push_back(pos);
+        auto edge_pos_tensor = base_coords.unsqueeze(1) +
+                               vertex_offsets_v0.unsqueeze(0) +
+                               t.unsqueeze(-1) * edge_diff_tensor.unsqueeze(0);
+
+        auto tri_edges = tri_table_.index_select(0, chunk_codes_long);
+        auto valid_mask = tri_edges >= 0;
+        auto tri_edges_clamped = tri_edges.clamp_min(0).to(torch::kLong);
+        auto one_hot = torch::one_hot(tri_edges_clamped, 12).to(options.dtype(grid_dtype));
+        auto vertex_positions = torch::bmm(one_hot, edge_pos_tensor);
+        vertex_positions *= valid_mask.unsqueeze(-1).to(options.dtype(grid_dtype));
+
+        auto valid_indices = torch::nonzero(valid_mask.reshape({-1})).squeeze(1);
+
+        if (valid_indices.numel() == 0) {
+            TORCH_CHECK(chunk_vertex_totals[chunk_index] == 0,
+                        "Chunk vertex bookkeeping mismatch");
+            continue;
+        }
+
+        auto chunk_verts = vertex_positions.reshape({-1, 3}).index_select(0, valid_indices).contiguous();
+        TORCH_CHECK(chunk_verts.size(0) == chunk_vertex_totals[chunk_index],
+                    "Chunk vertex count mismatch");
+
+        verts.narrow(0, vertex_offset, chunk_verts.size(0)).copy_(chunk_verts);
+
+        auto chunk_tri = torch::arange(chunk_verts.size(0),
+                                       torch::TensorOptions().dtype(torch::kInt64).device(device_));
+        chunk_tri += vertex_offset;
+        chunk_tri = chunk_tri.view({-1, 3}).to(torch::kInt32);
+        tris.narrow(0, triangle_offset, chunk_tri.size(0)).copy_(chunk_tri);
+
+        vertex_offset += chunk_verts.size(0);
+        triangle_offset += chunk_tri.size(0);
     }
 
-    auto edge_pos_tensor = torch::stack(edge_positions, 1); // [num_cubes, 12, 3]
-
-    auto cube_codes_long = cube_codes.to(torch::kLong);
-    auto tri_edges = tri_table_.index_select(0, cube_codes_long); // [num_cubes, 16]
-    auto valid_mask = tri_edges >= 0;
-    auto vertex_counts = valid_mask.sum(1, true); // [num_cubes, 1]
-    auto total_vertices = vertex_counts.sum().template item<int64_t>();
-
-    if (total_vertices == 0) {
-        auto empty_verts = torch::empty({0, 3}, grid.options().dtype(grid_dtype).device(device_));
-        auto empty_tris = torch::empty({0, 3}, torch::TensorOptions().dtype(torch::kInt32).device(device_));
-        return {empty_verts, empty_tris};
-    }
-
-    auto tri_edges_clamped = tri_edges.clamp_min(0).to(torch::kLong);
-    auto one_hot = torch::one_hot(tri_edges_clamped, 12).to(grid.options().dtype(grid_dtype));
-    auto vertex_positions = torch::bmm(one_hot, edge_pos_tensor);
-    vertex_positions *= valid_mask.unsqueeze(-1).to(grid.options().dtype(grid_dtype));
-
-    auto valid_mask_flat = valid_mask.reshape({-1});
-    auto vertex_positions_flat = vertex_positions.reshape({-1, 3});
-    auto valid_indices = torch::nonzero(valid_mask_flat).squeeze(1);
-
-    auto verts = vertex_positions_flat.index_select(0, valid_indices).contiguous();
+    TORCH_CHECK(vertex_offset == total_vertices,
+                "Final vertex count mismatch");
+    TORCH_CHECK(triangle_offset == total_vertices / 3,
+                "Final triangle count mismatch");
 
     if (deform.defined() && verts.size(0) > 0) {
         int64_t dim0 = dims[0];
@@ -233,21 +319,6 @@ std::tuple<torch::Tensor, torch::Tensor> MPSMarchingCubesBackend<Scalar, IndexTy
         auto deform_offsets = deform_flat.index_select(0, linear_indices).to(verts.dtype());
         verts = verts + deform_offsets;
     }
-
-    auto vertex_counts_flat = vertex_counts.reshape({num_cubes});
-    auto row_prefix = valid_mask.to(torch::kLong).cumsum(1);
-    auto prefix_total = vertex_counts_flat.cumsum(0);
-    auto vertex_offsets_tensor = torch::zeros_like(vertex_counts_flat);
-    if (num_cubes > 1) {
-        vertex_offsets_tensor.slice(0, 1, num_cubes)
-            .copy_(prefix_total.slice(0, 0, num_cubes - 1));
-    }
-    auto global_indices = row_prefix - 1 + vertex_offsets_tensor.view({num_cubes, 1});
-    global_indices.masked_fill_(~valid_mask, -1);
-
-    auto global_indices_flat = global_indices.reshape({-1});
-    auto used_indices = global_indices_flat.index_select(0, valid_indices);
-    auto tris = used_indices.view({-1, 3}).to(torch::kInt32).contiguous();
 
     return {verts, tris};
 }
