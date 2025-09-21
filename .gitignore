@@ -5,3 +5,5 @@ build
 *.so
 .vscode
 dist/
+
+.DS_Store
