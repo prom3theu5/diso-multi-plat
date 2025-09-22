@@ -9,6 +9,21 @@
 namespace device_abstraction {
 
 namespace {
+torch::Tensor stable_nonzero_1d(const torch::Tensor& mask, const torch::Device& target_device) {
+    TORCH_CHECK(mask.dim() == 1, "stable_nonzero_1d expects a 1D tensor");
+
+    torch::Tensor mask_cpu = mask.device().type() == torch::kCPU
+        ? mask
+        : mask.to(torch::kCPU);
+
+    auto indices_cpu = torch::nonzero(mask_cpu).squeeze(1);
+
+    if (target_device.type() == torch::kCPU) {
+        return indices_cpu;
+    }
+    return indices_cpu.to(target_device);
+}
+
 std::array<torch::Tensor, 8> gather_vertex_values(
     const torch::Tensor& grid,
     int64_t nx,
@@ -238,7 +253,7 @@ std::tuple<torch::Tensor, torch::Tensor> MPSMarchingCubesBackend<Scalar, IndexTy
         return {empty_verts, empty_tris};
     }
 
-    auto used_indices = torch::nonzero(active_mask).squeeze(1);
+    auto used_indices = stable_nonzero_1d(active_mask, device_);
 
     auto edge_counts = edge_x_mask_flat.to(torch::kLong) +
                        edge_y_mask_flat.to(torch::kLong) +
@@ -300,7 +315,7 @@ std::tuple<torch::Tensor, torch::Tensor> MPSMarchingCubesBackend<Scalar, IndexTy
                             const torch::Tensor& deform0_all,
                             const torch::Tensor& deform1_all,
                             int axis) {
-        auto idx_cells = torch::nonzero(axis_mask).squeeze(1);
+        auto idx_cells = stable_nonzero_1d(axis_mask, device_);
         if (idx_cells.numel() == 0) {
             return;
         }
@@ -618,7 +633,7 @@ void MPSMarchingCubesBackend<Scalar, IndexType>::backward(
                             const torch::Tensor& safe_denom_all,
                             const torch::Tensor& deform1_all) {
         auto axis_mask = slots_tensor.ge(0);
-        auto idx_cells = torch::nonzero(axis_mask).squeeze(1);
+        auto idx_cells = stable_nonzero_1d(axis_mask, device_);
         if (idx_cells.numel() == 0) {
             return;
         }
