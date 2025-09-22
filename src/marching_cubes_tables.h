@@ -285,4 +285,19 @@ inline constexpr std::array<std::array<int, 2>, 12> kEdgeConnection = {{{0, 1}, 
 
 inline constexpr std::array<std::array<int, 3>, 8> kVertexOffset = {{{0, 0, 0}, {1, 0, 0}, {1, 1, 0}, {0, 1, 0}, {0, 0, 1}, {1, 0, 1}, {1, 1, 1}, {0, 1, 1}}};
 
+inline constexpr std::array<std::array<int, 4>, 12> kEdgeCanonical = {{
+    {{0, 0, 0, 0}},
+    {{1, 0, 0, 2}},
+    {{0, 0, 1, 0}},
+    {{0, 0, 0, 2}},
+    {{0, 1, 0, 0}},
+    {{1, 1, 0, 2}},
+    {{0, 1, 1, 0}},
+    {{0, 1, 0, 2}},
+    {{0, 0, 0, 1}},
+    {{1, 0, 0, 1}},
+    {{1, 0, 1, 1}},
+    {{0, 0, 1, 1}}
+}};
+
 } // namespace marching_cubes_tables

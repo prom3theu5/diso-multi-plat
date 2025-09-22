@@ -15,6 +15,15 @@ private:
     torch::Tensor tri_table_;
     torch::Tensor edge_connection_table_;
     torch::Tensor vertex_offset_table_;
+    torch::Tensor edge_location_table_;
+
+    torch::Tensor last_inverse_;
+    int64_t last_unique_size_ = -1;
+
+    torch::Tensor first_cell_used_;
+    torch::Tensor used_to_first_vert_;
+    torch::Tensor axis_slot_;
+    torch::Tensor used_indices_;
 
     // Helper functions
     torch::Tensor compute_cube_codes(const torch::Tensor& grid, Scalar iso);

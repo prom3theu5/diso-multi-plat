@@ -5,7 +5,6 @@
 #include <cerrno>
 #include <cstdlib>
 #include <iostream>
-#include <vector>
 
 namespace device_abstraction {
 
@@ -69,6 +68,10 @@ MPSMarchingCubesBackend<Scalar, IndexType>::MPSMarchingCubesBackend(torch::Devic
         vertex_offset_table_ = create_vertex_offset_table(torch::kCPU);
         std::cout << "Vertex offset table created" << std::endl;
 
+        std::cout << "Creating edge location table..." << std::endl;
+        edge_location_table_ = create_edge_location_table(torch::kCPU);
+        std::cout << "Edge location table created" << std::endl;
+
         // Move tables to target device if needed
         if (device_.type() != torch::kCPU) {
             std::cout << "Moving lookup tables to target device..." << std::endl;
@@ -77,11 +80,14 @@ MPSMarchingCubesBackend<Scalar, IndexType>::MPSMarchingCubesBackend(torch::Devic
                 tri_table_ = tri_table_.to(device_);
                 edge_connection_table_ = edge_connection_table_.to(device_);
                 vertex_offset_table_ = vertex_offset_table_.to(device_);
+                edge_location_table_ = edge_location_table_.to(device_);
             } catch (const std::exception& e) {
                 std::cerr << "Failed to move lookup tables to target device: " << e.what() << std::endl;
                 throw std::runtime_error("MPS device tensor operations failed: " + std::string(e.what()));
             }
         }
+
+        last_unique_size_ = 0;
         
         std::cout << "Initialized MPS Marching Cubes backend on device: " << device_ << std::endl;
     } catch (const std::exception& e) {
@@ -99,9 +105,12 @@ torch::Tensor MPSMarchingCubesBackend<Scalar, IndexType>::compute_cube_codes(
 
     auto dims = grid.sizes();
     TORCH_CHECK(dims.size() == 3, "Grid tensor must be 3D");
-    int64_t nx = dims[0] - 1;
-    int64_t ny = dims[1] - 1;
-    int64_t nz = dims[2] - 1;
+    int64_t grid_dim0 = dims[0];
+    int64_t grid_dim1 = dims[1];
+    int64_t grid_dim2 = dims[2];
+    int64_t nx = grid_dim0 - 1;
+    int64_t ny = grid_dim1 - 1;
+    int64_t nz = grid_dim2 - 1;
 
     if (nx <= 0 || ny <= 0 || nz <= 0) {
         return torch::zeros({0}, torch::TensorOptions().dtype(torch::kInt32).device(device_));
@@ -127,202 +136,254 @@ std::tuple<torch::Tensor, torch::Tensor> MPSMarchingCubesBackend<Scalar, IndexTy
 ) {
     auto dims = grid.sizes();
     TORCH_CHECK(dims.size() == 3, "Grid tensor must be 3D");
-    int64_t nx = dims[0] - 1;
-    int64_t ny = dims[1] - 1;
-    int64_t nz = dims[2] - 1;
+    int64_t grid_dim0 = dims[0];
+    int64_t grid_dim1 = dims[1];
+    int64_t grid_dim2 = dims[2];
+    int64_t nx = grid_dim0 - 1;
+    int64_t ny = grid_dim1 - 1;
+    int64_t nz = grid_dim2 - 1;
 
     if (nx <= 0 || ny <= 0 || nz <= 0) {
         auto empty_verts = torch::empty({0, 3}, grid.options().dtype(grid.dtype()).device(device_));
         auto empty_tris = torch::empty({0, 3}, torch::TensorOptions().dtype(torch::kInt32).device(device_));
+        first_cell_used_ = torch::Tensor();
+        used_to_first_vert_ = torch::Tensor();
+        axis_slot_ = torch::Tensor();
+        used_indices_ = torch::Tensor();
+        last_inverse_ = torch::Tensor();
+        last_unique_size_ = 0;
         return {empty_verts, empty_tris};
     }
 
     const int64_t num_cubes = nx * ny * nz;
-    auto grid_dtype = grid.dtype();
-    auto options = grid.options();
+    auto options_float = grid.options();
+    auto options_long = torch::TensorOptions().dtype(torch::kLong).device(device_);
 
-    TORCH_CHECK(cube_codes.dim() == 1, "Cube code tensor must be 1D");
+    auto base = grid.narrow(0, 0, nx).narrow(1, 0, ny).narrow(2, 0, nz);
+    auto neighbor_x = grid.narrow(0, 1, nx).narrow(1, 0, ny).narrow(2, 0, nz);
+    auto neighbor_y = grid.narrow(0, 0, nx).narrow(1, 1, ny).narrow(2, 0, nz);
+    auto neighbor_z = grid.narrow(0, 0, nx).narrow(1, 0, ny).narrow(2, 1, nz);
 
-    auto active_mask = (cube_codes != 0) & (cube_codes != 255);
-    auto active_indices = torch::nonzero(active_mask).squeeze(1);
-    int64_t num_active = active_indices.size(0);
+    auto iso_tensor = torch::full_like(base, iso);
 
-    if (num_active == 0) {
-        auto empty_verts = torch::empty({0, 3}, options.dtype(grid_dtype).device(device_));
+    auto edge_x_mask = torch::logical_or(
+        torch::logical_and(base.lt(iso_tensor), neighbor_x.ge(iso_tensor)),
+        torch::logical_and(neighbor_x.lt(iso_tensor), base.ge(iso_tensor))
+    );
+    auto edge_y_mask = torch::logical_or(
+        torch::logical_and(base.lt(iso_tensor), neighbor_y.ge(iso_tensor)),
+        torch::logical_and(neighbor_y.lt(iso_tensor), base.ge(iso_tensor))
+    );
+    auto edge_z_mask = torch::logical_or(
+        torch::logical_and(base.lt(iso_tensor), neighbor_z.ge(iso_tensor)),
+        torch::logical_and(neighbor_z.lt(iso_tensor), base.ge(iso_tensor))
+    );
+
+    auto denom_x = neighbor_x - base;
+    auto denom_y = neighbor_y - base;
+    auto denom_z = neighbor_z - base;
+
+    auto eps = torch::full_like(denom_x, static_cast<Scalar>(1e-6));
+
+    auto safe_denom_x = torch::where(
+        torch::abs(denom_x) < eps,
+        torch::where(denom_x.eq(0), torch::ones_like(denom_x), torch::sign(denom_x)) * eps,
+        denom_x
+    );
+    auto safe_denom_y = torch::where(
+        torch::abs(denom_y) < eps,
+        torch::where(denom_y.eq(0), torch::ones_like(denom_y), torch::sign(denom_y)) * eps,
+        denom_y
+    );
+    auto safe_denom_z = torch::where(
+        torch::abs(denom_z) < eps,
+        torch::where(denom_z.eq(0), torch::ones_like(denom_z), torch::sign(denom_z)) * eps,
+        denom_z
+    );
+
+    auto t_x = torch::clamp((iso_tensor - base) / safe_denom_x, static_cast<Scalar>(0), static_cast<Scalar>(1));
+    auto t_y = torch::clamp((iso_tensor - base) / safe_denom_y, static_cast<Scalar>(0), static_cast<Scalar>(1));
+    auto t_z = torch::clamp((iso_tensor - base) / safe_denom_z, static_cast<Scalar>(0), static_cast<Scalar>(1));
+
+    auto edge_x_mask_flat = edge_x_mask.reshape({-1});
+    auto edge_y_mask_flat = edge_y_mask.reshape({-1});
+    auto edge_z_mask_flat = edge_z_mask.reshape({-1});
+
+    auto t_x_flat = t_x.reshape({-1});
+    auto t_y_flat = t_y.reshape({-1});
+    auto t_z_flat = t_z.reshape({-1});
+
+    auto d0_flat = base.reshape({-1});
+    auto dx_flat = neighbor_x.reshape({-1});
+    auto dy_flat = neighbor_y.reshape({-1});
+    auto dz_flat = neighbor_z.reshape({-1});
+
+    auto safe_denom_x_flat = safe_denom_x.reshape({-1});
+    auto safe_denom_y_flat = safe_denom_y.reshape({-1});
+    auto safe_denom_z_flat = safe_denom_z.reshape({-1});
+
+    auto cube_codes_flat = cube_codes.reshape({-1});
+    auto active_mask = cube_codes_flat.ne(0) & cube_codes_flat.ne(255);
+    int64_t num_used = active_mask.sum().template item<int64_t>();
+
+    if (num_used == 0) {
+        auto empty_verts = torch::empty({0, 3}, options_float);
         auto empty_tris = torch::empty({0, 3}, torch::TensorOptions().dtype(torch::kInt32).device(device_));
+        first_cell_used_ = torch::Tensor();
+        used_to_first_vert_ = torch::Tensor();
+        axis_slot_ = torch::Tensor();
+        used_indices_ = torch::Tensor();
+        last_inverse_ = torch::Tensor();
+        last_unique_size_ = 0;
         return {empty_verts, empty_tris};
     }
 
-    auto active_cube_codes = cube_codes.index_select(0, active_indices);
-    auto active_cube_codes_long = active_cube_codes.to(torch::kLong);
+    auto used_indices = torch::nonzero(active_mask).squeeze(1);
 
-    const int64_t default_chunk = 250000;
-    int64_t chunk_limit = default_chunk;
-    if (const char* env_chunk = std::getenv("DISO_MPS_CHUNK_SIZE")) {
-        char* end_ptr = nullptr;
-        errno = 0;
-        auto parsed = std::strtoll(env_chunk, &end_ptr, 10);
-        if (end_ptr != env_chunk && errno == 0 && parsed > 0) {
-            chunk_limit = static_cast<int64_t>(parsed);
-        } else {
-            std::cout << "DISO_MPS_CHUNK_SIZE invalid, using default " << default_chunk << std::endl;
-        }
+    auto edge_counts = edge_x_mask_flat.to(torch::kLong) +
+                       edge_y_mask_flat.to(torch::kLong) +
+                       edge_z_mask_flat.to(torch::kLong);
+    auto used_counts = edge_counts.index_select(0, used_indices);
+
+    auto used_to_first = torch::zeros({num_used + 1}, options_long);
+    if (num_used > 0) {
+        used_to_first.slice(0, 1, num_used + 1).copy_(used_counts.cumsum(0));
+    }
+    int64_t total_vertices = used_to_first[-1].template item<int64_t>();
+
+    auto first_cell_used = torch::zeros({num_cubes + 1}, options_long);
+    if (num_cubes > 0) {
+        first_cell_used.slice(0, 1, num_cubes + 1).copy_(active_mask.to(torch::kLong).cumsum(0));
+    }
+    auto first_cell_used_flat = first_cell_used.slice(0, 0, num_cubes);
+
+    auto verts = torch::empty({total_vertices, 3}, options_float);
+    auto axis_slot = torch::full({num_used, 3}, -1, options_long);
+    auto slot_start = used_to_first.slice(0, 0, num_used);
+    auto current_slot = slot_start.clone();
+
+    auto xs = torch::arange(0, nx, options_long).view({nx, 1, 1}).expand({nx, ny, nz});
+    auto ys = torch::arange(0, ny, options_long).view({1, ny, 1}).expand({nx, ny, nz});
+    auto zs = torch::arange(0, nz, options_long).view({1, 1, nz}).expand({nx, ny, nz});
+    auto base_coords_long = torch::stack({xs, ys, zs}, 3).reshape({num_cubes, 3});
+    auto base_coords_used_long = base_coords_long.index_select(0, used_indices);
+    auto base_coords_used_float = base_coords_used_long.to(options_float);
+
+    auto cross_x_used = edge_x_mask_flat.index_select(0, used_indices);
+    auto cross_y_used = edge_y_mask_flat.index_select(0, used_indices);
+    auto cross_z_used = edge_z_mask_flat.index_select(0, used_indices);
+
+    auto t_x_used = t_x_flat.index_select(0, used_indices);
+    auto t_y_used = t_y_flat.index_select(0, used_indices);
+    auto t_z_used = t_z_flat.index_select(0, used_indices);
+
+    torch::Tensor deform0_used;
+    torch::Tensor deform_x1_used;
+    torch::Tensor deform_y1_used;
+    torch::Tensor deform_z1_used;
+    bool has_deform = deform.defined() && deform.numel() > 0;
+    if (has_deform) {
+        auto deform_cast = deform.to(options_float);
+        auto deform0 = deform_cast.narrow(0, 0, nx).narrow(1, 0, ny).narrow(2, 0, nz);
+        auto deform_x1 = deform_cast.narrow(0, 1, nx).narrow(1, 0, ny).narrow(2, 0, nz);
+        auto deform_y1 = deform_cast.narrow(0, 0, nx).narrow(1, 1, ny).narrow(2, 0, nz);
+        auto deform_z1 = deform_cast.narrow(0, 0, nx).narrow(1, 0, ny).narrow(2, 1, nz);
+
+        deform0_used = deform0.reshape({num_cubes, deform.size(3)}).index_select(0, used_indices);
+        deform_x1_used = deform_x1.reshape({num_cubes, deform.size(3)}).index_select(0, used_indices);
+        deform_y1_used = deform_y1.reshape({num_cubes, deform.size(3)}).index_select(0, used_indices);
+        deform_z1_used = deform_z1.reshape({num_cubes, deform.size(3)}).index_select(0, used_indices);
     }
 
-    if (chunk_limit <= 0) {
-        chunk_limit = 1;
-    }
-
-    const int64_t stride_x = ny * nz;
-    const int64_t stride_y = nz;
-
-    std::vector<int64_t> chunk_vertex_totals;
-    chunk_vertex_totals.reserve((num_active + chunk_limit - 1) / chunk_limit);
-    int64_t total_vertices = 0;
-
-    for (int64_t start = 0; start < num_active; start += chunk_limit) {
-        int64_t end = std::min(start + chunk_limit, num_active);
-        auto chunk_codes = active_cube_codes_long.slice(0, start, end);
-        auto tri_edges = tri_table_.index_select(0, chunk_codes);
-        auto valid_mask = tri_edges >= 0;
-        auto chunk_vertices = valid_mask.sum().template item<int64_t>();
-        chunk_vertex_totals.push_back(chunk_vertices);
-        total_vertices += chunk_vertices;
-    }
-
-    if (total_vertices == 0) {
-        auto empty_verts = torch::empty({0, 3}, options.dtype(grid_dtype).device(device_));
-        auto empty_tris = torch::empty({0, 3}, torch::TensorOptions().dtype(torch::kInt32).device(device_));
-        return {empty_verts, empty_tris};
-    }
-
-    TORCH_CHECK(total_vertices % 3 == 0,
-                "Marching Cubes produced non-triangle vertex count: ", total_vertices);
-
-    auto verts = torch::empty({total_vertices, 3}, options.dtype(grid_dtype).device(device_));
-    auto tris = torch::empty({total_vertices / 3, 3}, torch::TensorOptions().dtype(torch::kInt32).device(device_));
-
-    auto edge_connections = edge_connection_table_.to(torch::TensorOptions().dtype(torch::kLong).device(device_));
-    auto v0_idx = edge_connections.select(1, 0);
-    auto v1_idx = edge_connections.select(1, 1);
-
-    auto vertex_offsets_tensor = vertex_offset_table_.to(options.dtype(grid_dtype));
-    auto vertex_offsets_v0 = vertex_offsets_tensor.index_select(0, v0_idx);
-    auto vertex_offsets_v1 = vertex_offsets_tensor.index_select(0, v1_idx);
-    auto edge_diff_tensor = (vertex_offsets_v1 - vertex_offsets_v0).to(options.dtype(grid_dtype));
-
-    auto vertex_values = gather_vertex_values(grid, nx, ny, nz);
-    std::array<torch::Tensor, 8> vertex_values_flat;
-    for (int i = 0; i < 8; ++i) {
-        vertex_values_flat[i] = vertex_values[i].reshape({num_cubes});
-    }
-
-    int64_t vertex_offset = 0;
-    int64_t triangle_offset = 0;
-    size_t chunk_index = 0;
-
-    for (int64_t start = 0; start < num_active; start += chunk_limit, ++chunk_index) {
-        int64_t end = std::min(start + chunk_limit, num_active);
-        auto chunk_indices = active_indices.slice(0, start, end);
-        auto chunk_codes_long = active_cube_codes_long.slice(0, start, end);
-
-        if (chunk_indices.numel() == 0) {
-            continue;
+    auto process_axis = [&](const torch::Tensor& axis_mask,
+                            const torch::Tensor& t_all,
+                            const torch::Tensor& deform0_all,
+                            const torch::Tensor& deform1_all,
+                            int axis) {
+        auto idx_cells = torch::nonzero(axis_mask).squeeze(1);
+        if (idx_cells.numel() == 0) {
+            return;
         }
 
-        std::vector<torch::Tensor> vertex_values_chunk_vec;
-        vertex_values_chunk_vec.reserve(8);
-        for (int i = 0; i < 8; ++i) {
-            vertex_values_chunk_vec.push_back(vertex_values_flat[i].index_select(0, chunk_indices));
-        }
-        auto vertex_values_chunk = torch::stack(vertex_values_chunk_vec, 0); // [8, chunk_size]
+        auto slots = current_slot.index_select(0, idx_cells);
+        axis_slot.index_put_({idx_cells, axis}, slots);
 
-        auto val0 = vertex_values_chunk.index_select(0, v0_idx).transpose(0, 1);
-        auto val1 = vertex_values_chunk.index_select(0, v1_idx).transpose(0, 1);
+        auto base_coords_l = base_coords_used_long.index_select(0, idx_cells);
+        auto base_coords_f = base_coords_used_float.index_select(0, idx_cells);
+        auto t_vals = t_all.index_select(0, idx_cells);
 
-        auto denom = val1 - val0;
-        auto abs_denom = torch::abs(denom);
-        auto eps_tensor = torch::full_like(denom, static_cast<Scalar>(1e-6));
-        auto sign = torch::sign(denom);
-        auto safe_sign = torch::where(sign == 0, torch::ones_like(sign), sign);
-        auto safe_denom = torch::where(abs_denom < eps_tensor, safe_sign * eps_tensor, denom);
-
-        auto iso_tensor = torch::full_like(val0, static_cast<Scalar>(iso));
-        auto raw_t = (iso_tensor - val0) / safe_denom;
-        auto t = torch::clamp(raw_t, static_cast<Scalar>(0), static_cast<Scalar>(1));
-
-        auto xs = torch::div(chunk_indices, stride_x, "floor");
-        auto rem = torch::remainder(chunk_indices, stride_x);
-        auto ys = torch::div(rem, stride_y, "floor");
-        auto zs = torch::remainder(rem, stride_y);
-        auto base_coords = torch::stack({xs, ys, zs}, 1).to(options.dtype(grid_dtype));
-
-        auto edge_pos_tensor = base_coords.unsqueeze(1) +
-                               vertex_offsets_v0.unsqueeze(0) +
-                               t.unsqueeze(-1) * edge_diff_tensor.unsqueeze(0);
-
-        auto tri_edges = tri_table_.index_select(0, chunk_codes_long);
-        auto valid_mask = tri_edges >= 0;
-        auto tri_edges_clamped = tri_edges.clamp_min(0).to(torch::kLong);
-        auto one_hot = torch::one_hot(tri_edges_clamped, 12).to(options.dtype(grid_dtype));
-        auto vertex_positions = torch::bmm(one_hot, edge_pos_tensor);
-        vertex_positions *= valid_mask.unsqueeze(-1).to(options.dtype(grid_dtype));
-
-        auto valid_indices = torch::nonzero(valid_mask.reshape({-1})).squeeze(1);
-
-        if (valid_indices.numel() == 0) {
-            TORCH_CHECK(chunk_vertex_totals[chunk_index] == 0,
-                        "Chunk vertex bookkeeping mismatch");
-            continue;
+        torch::Tensor deform0_vals;
+        torch::Tensor deform1_vals;
+        if (has_deform) {
+            deform0_vals = deform0_all.index_select(0, idx_cells);
+            deform1_vals = deform1_all.index_select(0, idx_cells);
         }
 
-        auto chunk_verts = vertex_positions.reshape({-1, 3}).index_select(0, valid_indices).contiguous();
-        TORCH_CHECK(chunk_verts.size(0) == chunk_vertex_totals[chunk_index],
-                    "Chunk vertex count mismatch");
+        auto zeros = torch::zeros_like(t_vals, options_float.dtype());
+        auto ones = torch::ones_like(t_vals, options_float.dtype());
 
-        verts.narrow(0, vertex_offset, chunk_verts.size(0)).copy_(chunk_verts);
+        auto offset_unit = torch::stack({
+            axis == 0 ? ones : zeros,
+            axis == 1 ? ones : zeros,
+            axis == 2 ? ones : zeros
+        }, 1);
 
-        auto chunk_tri = torch::arange(chunk_verts.size(0),
-                                       torch::TensorOptions().dtype(torch::kInt64).device(device_));
-        chunk_tri += vertex_offset;
-        chunk_tri = chunk_tri.view({-1, 3}).to(torch::kInt32);
-        tris.narrow(0, triangle_offset, chunk_tri.size(0)).copy_(chunk_tri);
+        auto p0 = base_coords_f;
+        if (has_deform) {
+            p0 = p0 + deform0_vals;
+        }
 
-        vertex_offset += chunk_verts.size(0);
-        triangle_offset += chunk_tri.size(0);
-    }
+        auto p1 = base_coords_f + offset_unit;
+        if (has_deform) {
+            p1 = p1 + deform1_vals;
+        }
 
-    TORCH_CHECK(vertex_offset == total_vertices,
-                "Final vertex count mismatch");
-    TORCH_CHECK(triangle_offset == total_vertices / 3,
-                "Final triangle count mismatch");
+        auto vertex_pos = p0 + (p1 - p0) * t_vals.unsqueeze(1);
+        verts.index_copy_(0, slots, vertex_pos);
 
-    if (deform.defined() && verts.size(0) > 0) {
-        int64_t dim0 = dims[0];
-        int64_t dim1 = dims[1];
-        int64_t dim2 = dims[2];
+        current_slot += axis_mask.to(torch::kLong);
+    };
 
-        auto max_coords = torch::tensor({static_cast<Scalar>(dim0 - 1),
-                                         static_cast<Scalar>(dim1 - 1),
-                                         static_cast<Scalar>(dim2 - 1)},
-                                        verts.options());
-        auto zeros = torch::zeros({3}, verts.options());
-        auto clamped = torch::minimum(torch::maximum(verts, zeros.unsqueeze(0)), max_coords.unsqueeze(0));
-        auto indices = clamped.floor().to(torch::kLong);
-        auto ix = indices.select(1, 0);
-        auto iy = indices.select(1, 1);
-        auto iz = indices.select(1, 2);
-        auto stride_x = dim1 * dim2;
-        auto stride_y = dim2;
-        auto linear_indices = ix * stride_x + iy * stride_y + iz;
-        auto deform_flat = deform.reshape({dim0 * dim1 * dim2, deform.size(3)});
-        auto deform_offsets = deform_flat.index_select(0, linear_indices).to(verts.dtype());
-        verts = verts + deform_offsets;
-    }
+    process_axis(cross_x_used, t_x_used, deform0_used, deform_x1_used, 0);
+    process_axis(cross_y_used, t_y_used, deform0_used, deform_y1_used, 1);
+    process_axis(cross_z_used, t_z_used, deform0_used, deform_z1_used, 2);
+
+    auto cube_codes_used = cube_codes_flat.index_select(0, used_indices).to(torch::kLong);
+    auto tri_edges = tri_table_.index_select(0, cube_codes_used);
+    auto valid_mask = tri_edges >= 0;
+    auto tri_edges_clamped = tri_edges.clamp_min(0).to(torch::kLong);
+
+    auto stride_x = ny * nz;
+    auto stride_y = nz;
+
+    auto edge_offsets_table = edge_location_table_.to(options_long);
+    auto edge_offsets = edge_offsets_table.index_select(0, tri_edges_clamped.reshape({-1})).view({num_used, 16, 4});
+
+    auto canonical_x = base_coords_used_long.select(1, 0).unsqueeze(1) + edge_offsets.select(2, 0);
+    auto canonical_y = base_coords_used_long.select(1, 1).unsqueeze(1) + edge_offsets.select(2, 1);
+    auto canonical_z = base_coords_used_long.select(1, 2).unsqueeze(1) + edge_offsets.select(2, 2);
+
+    auto canonical_index = canonical_x * stride_x + canonical_y * stride_y + canonical_z;
+    auto used_index_for_edges = first_cell_used_flat.index_select(0, canonical_index.reshape({-1})).view({num_used, 16});
+
+    auto axis_index = edge_offsets.select(2, 3).to(torch::kLong);
+    auto axis_slot_map = axis_slot.index_select(0, used_index_for_edges.reshape({-1})).view({num_used, 16, 3});
+    auto axis_slot_safe = axis_slot_map.clamp_min(int64_t{0});
+    auto vertex_idx = axis_slot_safe.gather(2, axis_index.unsqueeze(-1)).squeeze(-1);
+    vertex_idx = vertex_idx.masked_fill(~valid_mask, 0);
+
+    auto tris = vertex_idx.masked_select(valid_mask).view({-1, 3}).to(torch::kInt32);
+
+    first_cell_used_ = first_cell_used;
+    used_to_first_vert_ = used_to_first;
+    axis_slot_ = axis_slot;
+    used_indices_ = used_indices;
+
+    last_inverse_ = torch::arange(total_vertices, options_long);
+    last_unique_size_ = total_vertices;
 
     return {verts, tris};
 }
-
 template <typename Scalar, typename IndexType>
 std::tuple<torch::Tensor, torch::Tensor> MPSMarchingCubesBackend<Scalar, IndexType>::forward(
     torch::Tensor grid, 
@@ -370,7 +431,6 @@ void MPSMarchingCubesBackend<Scalar, IndexType>::backward(
     torch::Tensor adj_grid,
     torch::Tensor adj_deform
 ) {
-    // Ensure tensors are on the correct device
     grid = grid.to(device_);
     adj_verts = adj_verts.to(device_);
     adj_grid = adj_grid.to(device_);
@@ -381,175 +441,261 @@ void MPSMarchingCubesBackend<Scalar, IndexType>::backward(
         adj_deform = adj_deform.to(device_);
     }
 
+    if (last_inverse_.defined() && last_unique_size_ == adj_verts.size(0)) {
+        adj_verts = adj_verts.index_select(0, last_inverse_);
+    }
+
     adj_grid.zero_();
     if (adj_deform.defined()) {
         adj_deform.zero_();
     }
 
     if (adj_verts.numel() == 0) {
-        std::cout << "MPS backward pass skipped due to zero vertices" << std::endl;
         return;
     }
+
+    TORCH_CHECK(used_to_first_vert_.defined(), "Cached edge slots are missing; run forward before backward");
+    TORCH_CHECK(axis_slot_.defined(), "Cached axis mapping is missing; run forward before backward");
+    TORCH_CHECK(used_indices_.defined(), "Cached used indices are missing; run forward before backward");
+
+    auto used_to_first = used_to_first_vert_.to(torch::kLong);
+    int64_t total_vertices = used_to_first[-1].template item<int64_t>();
+    TORCH_CHECK(adj_verts.size(0) == total_vertices,
+                "Adjoint vertex count does not match cached canonical slots");
+
+    auto used_indices = used_indices_.to(torch::kLong);
+    int64_t num_used = used_indices.size(0);
+    if (num_used == 0) {
+        return;
+    }
+
+    auto axis_slot = axis_slot_.to(torch::kLong);
+    TORCH_CHECK(axis_slot.size(0) == num_used && axis_slot.size(1) == 3,
+                "Axis slot cache has unexpected shape");
 
     auto dims = grid.sizes();
     TORCH_CHECK(dims.size() == 3, "Grid tensor must be 3D");
 
-    int64_t dim0 = dims[0];
-    int64_t dim1 = dims[1];
-    int64_t dim2 = dims[2];
+    int64_t grid_dim0 = dims[0];
+    int64_t grid_dim1 = dims[1];
+    int64_t grid_dim2 = dims[2];
 
-    if (dim0 < 2 || dim1 < 2 || dim2 < 2) {
-        std::cout << "MPS backward pass skipped due to degenerate grid" << std::endl;
+    if (grid_dim0 < 2 || grid_dim1 < 2 || grid_dim2 < 2) {
         return;
     }
 
-    int64_t nx = dim0 - 1;
-    int64_t ny = dim1 - 1;
-    int64_t nz = dim2 - 1;
+    int64_t nx = grid_dim0 - 1;
+    int64_t ny = grid_dim1 - 1;
+    int64_t nz = grid_dim2 - 1;
+    int64_t num_cubes = nx * ny * nz;
 
-    auto cube_codes = compute_cube_codes(grid, iso);
-    auto num_cubes = cube_codes.size(0);
+    auto options_float = grid.options();
+    auto options_long = torch::TensorOptions().dtype(torch::kLong).device(device_);
 
-    if (num_cubes == 0) {
-        std::cout << "MPS backward pass skipped due to zero cubes" << std::endl;
-        return;
+    auto base = grid.narrow(0, 0, nx).narrow(1, 0, ny).narrow(2, 0, nz);
+    auto neighbor_x = grid.narrow(0, 1, nx).narrow(1, 0, ny).narrow(2, 0, nz);
+    auto neighbor_y = grid.narrow(0, 0, nx).narrow(1, 1, ny).narrow(2, 0, nz);
+    auto neighbor_z = grid.narrow(0, 0, nx).narrow(1, 0, ny).narrow(2, 1, nz);
+
+    auto iso_tensor = torch::full_like(base, iso);
+
+    auto edge_x_mask = torch::logical_or(
+        torch::logical_and(base.lt(iso_tensor), neighbor_x.ge(iso_tensor)),
+        torch::logical_and(neighbor_x.lt(iso_tensor), base.ge(iso_tensor))
+    );
+    auto edge_y_mask = torch::logical_or(
+        torch::logical_and(base.lt(iso_tensor), neighbor_y.ge(iso_tensor)),
+        torch::logical_and(neighbor_y.lt(iso_tensor), base.ge(iso_tensor))
+    );
+    auto edge_z_mask = torch::logical_or(
+        torch::logical_and(base.lt(iso_tensor), neighbor_z.ge(iso_tensor)),
+        torch::logical_and(neighbor_z.lt(iso_tensor), base.ge(iso_tensor))
+    );
+
+    auto denom_x = neighbor_x - base;
+    auto denom_y = neighbor_y - base;
+    auto denom_z = neighbor_z - base;
+
+    auto eps = torch::full_like(denom_x, static_cast<Scalar>(1e-6));
+
+    auto safe_denom_x = torch::where(
+        torch::abs(denom_x) < eps,
+        torch::where(denom_x.eq(0), torch::ones_like(denom_x), torch::sign(denom_x)) * eps,
+        denom_x
+    );
+    auto safe_denom_y = torch::where(
+        torch::abs(denom_y) < eps,
+        torch::where(denom_y.eq(0), torch::ones_like(denom_y), torch::sign(denom_y)) * eps,
+        denom_y
+    );
+    auto safe_denom_z = torch::where(
+        torch::abs(denom_z) < eps,
+        torch::where(denom_z.eq(0), torch::ones_like(denom_z), torch::sign(denom_z)) * eps,
+        denom_z
+    );
+
+    auto t_x = torch::clamp((iso_tensor - base) / safe_denom_x, static_cast<Scalar>(0), static_cast<Scalar>(1));
+    auto t_y = torch::clamp((iso_tensor - base) / safe_denom_y, static_cast<Scalar>(0), static_cast<Scalar>(1));
+    auto t_z = torch::clamp((iso_tensor - base) / safe_denom_z, static_cast<Scalar>(0), static_cast<Scalar>(1));
+
+    auto edge_x_mask_flat = edge_x_mask.reshape({-1});
+    auto edge_y_mask_flat = edge_y_mask.reshape({-1});
+    auto edge_z_mask_flat = edge_z_mask.reshape({-1});
+
+    auto t_x_flat = t_x.reshape({-1});
+    auto t_y_flat = t_y.reshape({-1});
+    auto t_z_flat = t_z.reshape({-1});
+
+    auto d0_flat = base.reshape({-1});
+    auto dx_flat = neighbor_x.reshape({-1});
+    auto dy_flat = neighbor_y.reshape({-1});
+    auto dz_flat = neighbor_z.reshape({-1});
+
+    auto safe_denom_x_flat = safe_denom_x.reshape({-1});
+    auto safe_denom_y_flat = safe_denom_y.reshape({-1});
+    auto safe_denom_z_flat = safe_denom_z.reshape({-1});
+
+    auto base_coords_long_full = torch::stack({
+        torch::arange(0, nx, options_long).view({nx, 1, 1}).expand({nx, ny, nz}),
+        torch::arange(0, ny, options_long).view({1, ny, 1}).expand({nx, ny, nz}),
+        torch::arange(0, nz, options_long).view({1, 1, nz}).expand({nx, ny, nz})
+    }, 3).reshape({num_cubes, 3});
+
+    auto base_coords_used_long = base_coords_long_full.index_select(0, used_indices);
+    auto base_coords_used_float = base_coords_used_long.to(options_float);
+
+    auto t_x_used = t_x_flat.index_select(0, used_indices);
+    auto t_y_used = t_y_flat.index_select(0, used_indices);
+    auto t_z_used = t_z_flat.index_select(0, used_indices);
+
+    auto d0_used = d0_flat.index_select(0, used_indices);
+    auto dx_used = dx_flat.index_select(0, used_indices);
+    auto dy_used = dy_flat.index_select(0, used_indices);
+    auto dz_used = dz_flat.index_select(0, used_indices);
+
+    auto safe_denom_x_used = safe_denom_x_flat.index_select(0, used_indices);
+    auto safe_denom_y_used = safe_denom_y_flat.index_select(0, used_indices);
+    auto safe_denom_z_used = safe_denom_z_flat.index_select(0, used_indices);
+
+    bool has_deform_offsets = deform.defined() && deform.numel() > 0;
+    bool track_deform_grad = has_deform_offsets && adj_deform.defined() && adj_deform.numel() > 0;
+
+    torch::Tensor deform0_used;
+    torch::Tensor deform_x1_used;
+    torch::Tensor deform_y1_used;
+    torch::Tensor deform_z1_used;
+    if (has_deform_offsets) {
+        auto deform_cast = deform.to(options_float);
+        auto deform0 = deform_cast.narrow(0, 0, nx).narrow(1, 0, ny).narrow(2, 0, nz);
+        auto deform_x1 = deform_cast.narrow(0, 1, nx).narrow(1, 0, ny).narrow(2, 0, nz);
+        auto deform_y1 = deform_cast.narrow(0, 0, nx).narrow(1, 1, ny).narrow(2, 0, nz);
+        auto deform_z1 = deform_cast.narrow(0, 0, nx).narrow(1, 0, ny).narrow(2, 1, nz);
+
+        deform0_used = deform0.reshape({num_cubes, deform.size(3)}).index_select(0, used_indices);
+        deform_x1_used = deform_x1.reshape({num_cubes, deform.size(3)}).index_select(0, used_indices);
+        deform_y1_used = deform_y1.reshape({num_cubes, deform.size(3)}).index_select(0, used_indices);
+        deform_z1_used = deform_z1.reshape({num_cubes, deform.size(3)}).index_select(0, used_indices);
     }
 
-    auto grid_dtype = grid.dtype();
-    auto options = grid.options();
-
-    auto cube_codes_long = cube_codes.to(torch::kLong);
-    auto tri_edges = tri_table_.index_select(0, cube_codes_long); // [num_cubes, 16]
-    auto valid_mask = tri_edges >= 0;
-    auto vertex_counts = valid_mask.sum(1, true);
-    auto total_vertices = vertex_counts.sum().template item<int64_t>();
-
-    if (total_vertices == 0) {
-        std::cout << "MPS backward pass skipped (no active triangles)" << std::endl;
-        return;
+    auto adj_grid_flat = adj_grid.view({grid_dim0 * grid_dim1 * grid_dim2});
+    torch::Tensor adj_deform_flat;
+    int64_t deform_stride_x = 0;
+    int64_t deform_stride_y = 0;
+    if (track_deform_grad) {
+        auto deform_dims = deform.sizes();
+        deform_stride_x = deform_dims[1] * deform_dims[2];
+        deform_stride_y = deform_dims[2];
+        adj_deform_flat = adj_deform.view({deform_dims[0] * deform_dims[1] * deform_dims[2], deform_dims[3]});
     }
 
-    auto valid_mask_flat = valid_mask.reshape({-1});
-    auto tri_edges_clamped = tri_edges.clamp_min(0).to(torch::kLong);
+    const int64_t grid_stride_x = grid_dim1 * grid_dim2;
+    const int64_t grid_stride_y = grid_dim2;
 
-    auto vertex_values = gather_vertex_values(grid, nx, ny, nz);
-    std::vector<torch::Tensor> vertex_values_flat(8);
-    for (int i = 0; i < 8; ++i) {
-        vertex_values_flat[i] = vertex_values[i].reshape({num_cubes});
-    }
+    auto process_axis = [&](int axis,
+                            const torch::Tensor& slots_tensor,
+                            const torch::Tensor& t_all,
+                            const torch::Tensor& d1_all,
+                            const torch::Tensor& safe_denom_all,
+                            const torch::Tensor& deform1_all) {
+        auto axis_mask = slots_tensor.ge(0);
+        auto idx_cells = torch::nonzero(axis_mask).squeeze(1);
+        if (idx_cells.numel() == 0) {
+            return;
+        }
 
-    auto vertex_values_tensor = torch::stack(vertex_values_flat, 0); // [8, num_cubes]
+        auto slots = slots_tensor.index_select(0, idx_cells);
+        auto adj_axis = adj_verts.index_select(0, slots).to(options_float.dtype());
 
-    auto edge_connections = edge_connection_table_.to(torch::TensorOptions().dtype(torch::kLong).device(device_));
-    auto v0_idx = edge_connections.select(1, 0);
-    auto v1_idx = edge_connections.select(1, 1);
+        auto base_coords_l = base_coords_used_long.index_select(0, idx_cells);
+        auto base_coords_f = base_coords_used_float.index_select(0, idx_cells);
+        auto t_vals = t_all.index_select(0, idx_cells);
+        auto d0_vals = d0_used.index_select(0, idx_cells);
+        auto d1_vals = d1_all.index_select(0, idx_cells);
+        auto safe_denom_vals = safe_denom_all.index_select(0, idx_cells);
 
-    auto vertex_offsets_tensor = vertex_offset_table_.to(options.dtype(grid_dtype));
-    auto vertex_offsets_v0 = vertex_offsets_tensor.index_select(0, v0_idx);
-    auto vertex_offsets_v1 = vertex_offsets_tensor.index_select(0, v1_idx);
-    auto edge_diff_tensor = (vertex_offsets_v1 - vertex_offsets_v0).to(options.dtype(grid_dtype)); // [12, 3]
+        torch::Tensor deform0_vals;
+        torch::Tensor deform1_vals;
+        if (has_deform_offsets) {
+            deform0_vals = deform0_used.index_select(0, idx_cells);
+            deform1_vals = deform1_all.index_select(0, idx_cells);
+        }
 
-    auto val0 = vertex_values_tensor.index_select(0, v0_idx).transpose(0, 1); // [num_cubes, 12]
-    auto val1 = vertex_values_tensor.index_select(0, v1_idx).transpose(0, 1);
+        auto zeros = torch::zeros_like(t_vals, options_float.dtype());
+        auto ones = torch::ones_like(t_vals, options_float.dtype());
 
-    auto denom = val1 - val0;
-    auto abs_denom = torch::abs(denom);
-    auto eps_tensor = torch::full_like(denom, static_cast<Scalar>(1e-6));
-    auto sign = torch::sign(denom);
-    auto safe_sign = torch::where(sign == 0, torch::ones_like(sign), sign);
-    auto safe_denom = torch::where(abs_denom < eps_tensor, safe_sign * eps_tensor, denom);
+        auto offset_unit = torch::stack({
+            axis == 0 ? ones : zeros,
+            axis == 1 ? ones : zeros,
+            axis == 2 ? ones : zeros
+        }, 1);
 
-    auto raw_t = (static_cast<Scalar>(iso) - val0) / safe_denom;
-    auto t = torch::clamp(raw_t, static_cast<Scalar>(0), static_cast<Scalar>(1));
-    auto interior_mask = (raw_t > static_cast<Scalar>(0)) & (raw_t < static_cast<Scalar>(1));
+        auto edge_diff = offset_unit;
+        if (has_deform_offsets) {
+            edge_diff = edge_diff + (deform1_vals - deform0_vals);
+        }
 
-    auto xs = torch::arange(0, nx, options).view({nx, 1, 1}).expand({nx, ny, nz}).reshape({num_cubes});
-    auto ys = torch::arange(0, ny, options).view({1, ny, 1}).expand({nx, ny, nz}).reshape({num_cubes});
-    auto zs = torch::arange(0, nz, options).view({1, 1, nz}).expand({nx, ny, nz}).reshape({num_cubes});
-    auto base_coords = torch::stack({xs, ys, zs}, 1); // [num_cubes, 3]
+        auto grad_t = (adj_axis * edge_diff).sum(-1);
 
-    auto edge_pos_tensor = base_coords.unsqueeze(1) +
-                           vertex_offsets_v0.unsqueeze(0) +
-                           t.unsqueeze(-1) * edge_diff_tensor.unsqueeze(0); // [num_cubes, 12, 3]
+        auto iso_local = torch::full_like(d0_vals, iso);
+        auto raw_t = (iso_local - d0_vals) / safe_denom_vals;
+        auto interior_mask = (raw_t > static_cast<Scalar>(0)) & (raw_t < static_cast<Scalar>(1));
+        grad_t = grad_t * interior_mask.to(options_float.dtype());
 
-    auto cube_index_grid = torch::arange(num_cubes, torch::TensorOptions().dtype(torch::kLong).device(device_))
-                               .view({num_cubes, 1})
-                               .expand_as(tri_edges_clamped);
-    auto cube_indices_valid = cube_index_grid.masked_select(valid_mask);
-    auto edge_indices_valid = tri_edges_clamped.masked_select(valid_mask);
-    auto edge_linear_indices = cube_indices_valid * 12 + edge_indices_valid;
+        auto denom_sq = safe_denom_vals * safe_denom_vals;
+        auto grad_val0 = grad_t * ((iso_local - d1_vals) / denom_sq);
+        auto grad_val1 = grad_t * (-(iso_local - d0_vals) / denom_sq);
 
-    auto edge_pos_flat = edge_pos_tensor.reshape({num_cubes * 12, 3});
-    auto verts_pre_deform = edge_pos_flat.index_select(0, edge_linear_indices);
+        auto base_linear = base_coords_l.select(1, 0) * grid_stride_x +
+                           base_coords_l.select(1, 1) * grid_stride_y +
+                           base_coords_l.select(1, 2);
+        int64_t neighbor_stride = axis == 0 ? grid_stride_x : (axis == 1 ? grid_stride_y : 1);
+        auto neighbor_linear = base_linear + neighbor_stride;
 
-    auto grad_edge_pos_flat = torch::zeros({num_cubes * 12, 3}, options.dtype(grid_dtype));
-    grad_edge_pos_flat.index_add_(0, edge_linear_indices, adj_verts);
-    auto grad_edge_pos = grad_edge_pos_flat.view({num_cubes, 12, 3});
+        adj_grid_flat.index_add_(0, base_linear, grad_val0);
+        adj_grid_flat.index_add_(0, neighbor_linear, grad_val1);
 
-    auto grad_t = (grad_edge_pos * edge_diff_tensor.unsqueeze(0)).sum(-1);
-    grad_t = grad_t * interior_mask.to(options.dtype(grid_dtype));
+        if (track_deform_grad) {
+            auto ones_local = torch::ones_like(t_vals, options_float.dtype());
+            auto one_minus_t = (ones_local - t_vals).unsqueeze(1);
+            auto t_unsqueezed = t_vals.unsqueeze(1);
+            auto adj_axis_deform = adj_axis.to(adj_deform.dtype());
 
-    auto denom_sq = safe_denom * safe_denom;
-    auto grad_val0 = grad_t * ((static_cast<Scalar>(iso) - val1) / denom_sq);
-    auto grad_val1 = grad_t * (-(static_cast<Scalar>(iso) - val0) / denom_sq);
+            auto deform_base_linear = base_coords_l.select(1, 0) * deform_stride_x +
+                                      base_coords_l.select(1, 1) * deform_stride_y +
+                                      base_coords_l.select(1, 2);
+            auto deform_neighbor_linear = deform_base_linear + neighbor_stride;
 
-    auto grad_vertex_values = torch::zeros({8, num_cubes}, options.dtype(grid_dtype));
-    auto v0_idx_cpu = v0_idx.to(torch::kCPU);
-    auto v1_idx_cpu = v1_idx.to(torch::kCPU);
-    auto v0_ptr = v0_idx_cpu.template data_ptr<int64_t>();
-    auto v1_ptr = v1_idx_cpu.template data_ptr<int64_t>();
-
-    for (int edge = 0; edge < 12; ++edge) {
-        int64_t idx0 = v0_ptr[edge];
-        int64_t idx1 = v1_ptr[edge];
-        grad_vertex_values.select(0, idx0).add_(grad_val0.select(1, edge));
-        grad_vertex_values.select(0, idx1).add_(grad_val1.select(1, edge));
-    }
-
-    const int vertex_offsets[8][3] = {
-        {0, 0, 0}, {1, 0, 0}, {1, 1, 0}, {0, 1, 0},
-        {0, 0, 1}, {1, 0, 1}, {1, 1, 1}, {0, 1, 1}
+            adj_deform_flat.index_add_(0, deform_base_linear,
+                                       adj_axis_deform * one_minus_t);
+            adj_deform_flat.index_add_(0, deform_neighbor_linear,
+                                       adj_axis_deform * t_unsqueezed);
+        }
     };
 
-    for (int i = 0; i < 8; ++i) {
-        auto grad_vals = grad_vertex_values.select(0, i).view({nx, ny, nz});
-        adj_grid.slice(0, vertex_offsets[i][0], vertex_offsets[i][0] + nx)
-                .slice(1, vertex_offsets[i][1], vertex_offsets[i][1] + ny)
-                .slice(2, vertex_offsets[i][2], vertex_offsets[i][2] + nz)
-                .add_(grad_vals);
-    }
-
-    if (deform.defined() && adj_deform.defined() && adj_verts.size(0) > 0) {
-        auto deform_dims = deform.sizes();
-        TORCH_CHECK(deform_dims.size() == 4, "Deform tensor must be 4D");
-
-        auto deform_size0 = deform_dims[0];
-        auto deform_size1 = deform_dims[1];
-        auto deform_size2 = deform_dims[2];
-
-        auto zeros = torch::zeros({3}, verts_pre_deform.options());
-        auto max_coords = torch::tensor({static_cast<Scalar>(deform_size0 - 1),
-                                         static_cast<Scalar>(deform_size1 - 1),
-                                         static_cast<Scalar>(deform_size2 - 1)},
-                                        verts_pre_deform.options());
-
-        auto clamped = torch::minimum(torch::maximum(verts_pre_deform, zeros.unsqueeze(0)), max_coords.unsqueeze(0));
-        auto indices = clamped.floor().to(torch::kLong);
-        auto ix = indices.select(1, 0);
-        auto iy = indices.select(1, 1);
-        auto iz = indices.select(1, 2);
-
-        auto stride_x = deform_size1 * deform_size2;
-        auto stride_y = deform_size2;
-        auto linear_indices = ix * stride_x + iy * stride_y + iz;
-
-        auto adj_deform_flat = adj_deform.view({deform_size0 * deform_size1 * deform_size2, deform.size(3)});
-        adj_deform_flat.index_add_(0, linear_indices, adj_verts.to(adj_deform.dtype()));
-    }
-
-    std::cout << "MPS backward pass completed - processed " << adj_verts.size(0) << " vertices" << std::endl;
+    process_axis(0, axis_slot.select(1, 0), t_x_used, dx_used, safe_denom_x_used, deform_x1_used);
+    process_axis(1, axis_slot.select(1, 1), t_y_used, dy_used, safe_denom_y_used, deform_y1_used);
+    process_axis(2, axis_slot.select(1, 2), t_z_used, dz_used, safe_denom_z_used, deform_z1_used);
 }
-
 // Dual Marching Cubes implementation
 template <typename Scalar, typename IndexType>
 MPSDualMarchingCubesBackend<Scalar, IndexType>::MPSDualMarchingCubesBackend(torch::Device device)

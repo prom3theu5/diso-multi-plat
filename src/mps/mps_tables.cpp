@@ -68,4 +68,18 @@ torch::Tensor create_vertex_offset_table(torch::Device device) {
     return tensor;
 }
 
+torch::Tensor create_edge_location_table(torch::Device device) {
+    auto options = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
+    auto tensor = torch::from_blob(
+        const_cast<int*>(&marching_cubes_tables::kEdgeCanonical[0][0]),
+        {12, 4},
+        options
+    ).clone();
+
+    if (device.type() != torch::kCPU) {
+        tensor = tensor.to(device);
+    }
+    return tensor;
+}
+
 } // namespace device_abstraction
